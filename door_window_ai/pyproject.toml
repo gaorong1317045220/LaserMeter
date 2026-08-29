@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "door-window-ai"
+version = "0.1.0"
+description = "Runtime ONNX inference for door, window and outlet segmentation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Door/Window AI Team" }]
+dependencies = [
+  "numpy>=1.24",
+  "Pillow>=10.0",
+  "onnxruntime>=1.18",
+  "opencv-python>=4.10",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/door_window_ai"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -1,0 +1,187 @@
+<!-- SPDX-License-Identifier: MIT -->
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>激光-相机外参标定 · 光斑点选</title>
+<style>
+  :root{color-scheme:dark;--bg:#0b1017;--panel:#131b26;--line:#26334a;--text:#eaf1f9;--muted:#8fa0b5;--cyan:#43d7e8;--green:#49d49d;--red:#ff6b79}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+  header{display:flex;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--line);background:#0e1520}
+  header h1{font-size:16px;margin:0}
+  header .hint{color:var(--muted);font-size:12px}
+  .spacer{flex:1}
+  button{min-height:36px;padding:0 14px;border:1px solid #34465d;border-radius:10px;background:#182333;color:var(--text);font-weight:650;cursor:pointer}
+  button:hover{border-color:#597696}
+  button.primary{background:linear-gradient(135deg,var(--cyan),#66a0ff);color:#061019;border-color:transparent}
+  main{max-width:1100px;margin:auto;padding:16px}
+  .stage{position:relative;display:inline-block;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#000;user-select:none;touch-action:none}
+  .stage img{display:block;max-width:100%;cursor:crosshair}
+  .mark{position:absolute;width:26px;height:26px;margin:-13px 0 0 -13px;border:3px solid var(--green);border-radius:50%;pointer-events:none;box-shadow:0 0 0 2px #000a,0 0 12px #49d49d88}
+  .centerx{position:absolute;left:50%;top:0;bottom:0;width:1px;background:#ff6b7955;pointer-events:none}
+  .centery{position:absolute;top:50%;left:0;right:0;height:1px;background:#ff6b7955;pointer-events:none}
+  .bar{display:flex;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap}
+  .info{color:var(--muted)}
+  .info b{color:var(--text)}
+  .zoomctrl{display:flex;gap:6px;align-items:center}
+  .msg{color:var(--green);font-size:12px}
+  .grid{display:grid;grid-template-columns:1fr 320px;gap:14px}
+  .side{display:flex;flex-direction:column;gap:8px}
+  .side .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px}
+  .side .card h3{margin:0 0 8px;font-size:13px;color:var(--muted)}
+  .thumb{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer;border:1px solid transparent}
+  .thumb:hover{background:#182333}
+  .thumb.active{border-color:var(--cyan);background:#10202e}
+  .thumb img{width:56px;height:42px;object-fit:cover;border-radius:6px;background:#000}
+  .thumb .tname{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .thumb .trange{font-size:12px}
+  .thumb .dot{width:10px;height:10px;border-radius:50%;background:#3a4a5f;flex:0 0 auto}
+  .thumb.marked .dot{background:var(--green)}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>激光-相机外参标定</h1>
+  <span class="hint">点击照片上的<strong>激光红点</strong>(忽略画面中心淡红准星线),保存后运行标定工具</span>
+  <div class="spacer"></div>
+  <span class="msg" id="msg"></span>
+  <button id="saveBtn" class="primary">保存标记</button>
+</header>
+<main>
+  <div class="grid">
+    <div>
+      <div class="stage" id="stage">
+        <img id="photo" alt="标定照片" draggable="false">
+        <div class="centerx"></div><div class="centery"></div>
+        <div class="mark" id="mark" style="display:none"></div>
+      </div>
+      <div class="bar">
+        <span class="info" id="info"></span>
+        <div class="spacer"></div>
+        <div class="zoomctrl">
+          <button id="zoomOut">−</button>
+          <span id="zoomLabel">100%</span>
+          <button id="zoomIn">+</button>
+        </div>
+        <button id="prevBtn">◀ 上一张</button>
+        <button id="nextBtn" class="primary">下一张 ▶</button>
+      </div>
+    </div>
+    <div class="side">
+      <div class="card">
+        <h3>照片列表(共 <span id="total"></span> 张)</h3>
+        <div id="list"></div>
+      </div>
+      <div class="card">
+        <h3>说明</h3>
+        <div style="color:var(--muted);font-size:12px">
+          1. 每张照片用鼠标/手指点击激光光斑的实际位置<br>
+          2. 绿色圆圈 = 已标记;点击照片任意处可重标<br>
+          3. 照片中心的淡红十字是相机叠加的准星,<strong>不要</strong>点它<br>
+          4. 点完所有照片后点击「保存标记」<br>
+          5. 然后在终端运行:<br><code style="color:var(--cyan)">python tools\calibrate_camera_extrinsics.py</code>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+<script>
+const state = {items: [], idx: 0, marks: {}, zoom: 1.0};
+const $ = id => document.getElementById(id);
+
+function refresh() {
+  const item = state.items[state.idx];
+  $("photo").src = "/calib_photos/" + item.name;
+  $("info").innerHTML = `第 <b>${state.idx + 1}</b> / ${state.items.length} 张 · 距离 <b>${item.range_m != null ? item.range_m.toFixed(3) + " m" : "未知"}</b> · 激光点 <b>${state.marks[item.name] ? "已标记 (" + state.marks[item.name].map(Math.round).join(",") + ")" : "未标记"}</b>`;
+  $("mark").style.display = state.marks[item.name] ? "block" : "none";
+  if (state.marks[item.name]) {
+    const [mx, my] = state.marks[item.name];
+    const img = $("photo");
+    const r = img.getBoundingClientRect();
+    $("mark").style.left = (mx / img.naturalWidth * r.width) + "px";
+    $("mark").style.top = (my / img.naturalHeight * r.height) + "px";
+  }
+  $("prevBtn").disabled = state.idx <= 0;
+  $("nextBtn").disabled = state.idx >= state.items.length - 1;
+  renderList();
+  applyZoom();
+}
+
+function renderList() {
+  $("total").textContent = state.items.length;
+  const list = $("list");
+  list.innerHTML = "";
+  state.items.forEach((item, i) => {
+    const div = document.createElement("div");
+    div.className = "thumb" + (i === state.idx ? " active" : "") + (state.marks[item.name] ? " marked" : "");
+    div.innerHTML = `<img src="/calib_photos/${item.name}"><div style="flex:1;min-width:0"><div class="tname">${item.name}</div><div class="trange">${item.range_m != null ? item.range_m.toFixed(3) + " m" : "?"}</div></div><div class="dot"></div>`;
+    div.onclick = () => { state.idx = i; refresh(); };
+    list.appendChild(div);
+  });
+}
+
+function applyZoom() {
+  $("photo").style.width = (100 * state.zoom) + "%";
+  $("zoomLabel").textContent = Math.round(state.zoom * 100) + "%";
+  if (state.marks[state.items[state.idx]?.name]) {
+    refresh();
+  }
+}
+
+$("stage").addEventListener("click", e => {
+  const img = $("photo");
+  const r = img.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width * img.naturalWidth;
+  const y = (e.clientY - r.top) / r.height * img.naturalHeight;
+  const item = state.items[state.idx];
+  state.marks[item.name] = [Math.round(x), Math.round(y)];
+  refresh();
+});
+
+$("prevBtn").onclick = () => { if (state.idx > 0) { state.idx--; refresh(); } };
+$("nextBtn").onclick = () => { if (state.idx < state.items.length - 1) { state.idx++; refresh(); } };
+$("zoomIn").onclick = () => { state.zoom = Math.min(4, state.zoom * 1.25); applyZoom(); };
+$("zoomOut").onclick = () => { state.zoom = Math.max(1, state.zoom / 1.25); applyZoom(); };
+
+$("saveBtn").onclick = async () => {
+  const missing = state.items.filter(i => !state.marks[i.name]).map(i => i.name);
+  const markedCount = state.items.length - missing.length;
+  if (!markedCount) {
+    $("msg").textContent = "还没有任何标记,请先点击激光点";
+    return;
+  }
+  const resp = await fetch("/api/calib-marks", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(state.marks),
+  });
+  const data = await resp.json();
+  if (data.ok) {
+    const note = missing.length ? `(跳过 ${missing.length} 张未标记: ${missing.join(", ")})` : "";
+    $("msg").textContent = `已保存 ${data.saved} 个标记 ✔ ${note}`;
+    $("msg").style.color = "#49d49d";
+  } else {
+    $("msg").textContent = "保存失败: " + data.error;
+  }
+};
+
+(async () => {
+  try {
+    const resp = await fetch("/api/calib-photos");
+    const data = await resp.json();
+    state.items = data.items || [];
+    if (!state.items.length) { $("info").textContent = "没有找到标定照片"; return; }
+    const marksResp = await fetch("/api/calib-marks?action=get");
+    const marksData = await marksResp.json();
+    if (marksData.ok) state.marks = marksData.marks || {};
+    refresh();
+  } catch (err) {
+    $("info").textContent = "加载失败: " + err;
+  }
+})();
+</script>
+</body>
+</html>

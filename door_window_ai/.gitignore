@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+runs/*
+!runs/.gitkeep
+datasets/raw/**/*
+datasets/interim/*
+datasets/unified/*
+datasets/splits/*
+datasets/exported/*
+!datasets/**/.gitkeep
+*.pt
+*.onnx
+

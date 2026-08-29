@@ -1,0 +1,15 @@
+{
+  "schema_version": "runtime-1.0",
+  "model_name": "door_window_outlet",
+  "model_version": "3.0.0",
+  "architecture": "YOLO26n-seg",
+  "task": "segment",
+  "input_size": 1024,
+  "classes": [
+    "door",
+    "window",
+    "outlet"
+  ],
+  "output_format": "yolo26_e2e",
+  "model_sha256": "41C2F0C111450B44B4E6C443869C0DAFD81C997123DBD798BC6720B415984A07"
+}

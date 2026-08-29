@@ -1,0 +1,7 @@
+# Verified for Windows packaging with Python 3.12.
+altgraph==0.17.5
+pefile==2024.8.26
+pyinstaller==6.20.0
+pyinstaller-hooks-contrib==2026.7
+pywin32-ctypes==0.2.3
+setuptools==84.0.0

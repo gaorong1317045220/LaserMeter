@@ -1,0 +1,8 @@
+# Verified on Python 3.12.10, Windows, 2026-08-28.
+flatbuffers==25.12.19
+numpy==2.5.2
+onnxruntime==1.29.0
+opencv-python==5.0.0.93
+packaging==26.3
+pillow==12.3.0
+protobuf==7.36.0

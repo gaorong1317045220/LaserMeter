@@ -1,0 +1,35 @@
+# ESP-IDF generated output
+**/build/
+build_*/
+sdkconfig.old
+*.log
+*.log.*
+*.trace
+*.bak
+*.swp
+sdkconfig
+
+# Local editor and Python cache
+.vscode/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.venv-*/
+
+# Local serial captures generated during ad-hoc diagnostics
+*.tmp
+*.temp
+*.dump
+
+# Runtime/user data and generated packages
+pc_app/data/
+pc_app/static/calib_photos/
+door_window_ai/datasets/
+door_window_ai/runs/
+dist/
+.backup/
+.codex-tmp/
+**/asset-sheet.*
