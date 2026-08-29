@@ -28,7 +28,10 @@ PACKAGES = (
 
 def is_license_file(relative_path: str) -> bool:
     normalized = relative_path.replace("\\", "/")
-    name = Path(normalized).name.lower()
+    path = Path(normalized)
+    name = path.name.lower()
+    if "__pycache__" in normalized.lower() or path.suffix.lower() in {".py", ".pyc", ".pyo", ".pyd"}:
+        return False
     return (
         "license" in name
         or "copying" in name
@@ -42,6 +45,8 @@ def main() -> int:
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     output = args.output.resolve()
+    if output.exists():
+        shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=True)
 
     manifest: list[str] = []
