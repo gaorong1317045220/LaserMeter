@@ -130,8 +130,7 @@ http://127.0.0.1:8000/
 
 `door_window_ai/src/door_window_ai/` 是项目自研的 ONNX 推理运行时，采用 MIT License。`pc_app/vision_worker.py` 加载模型并完成门、窗、插座分割与轮廓后处理。
 
-`door_window_ai/models/door_window_outlet_v3/model.onnx` 不是软件源码，不能由根目录 MIT 自动重新授权。其内嵌元数据声明 Ultralytics 8.4.118 / AGPL-3.0；发布模型及打包 AI 可执行程序前，项目所有者必须确认基础权重、训练数据及商业再分发权利。详见同目录的 `MODEL_LICENSE.md`。
-
+`door_window_ai/models/door_window_outlet_v3/model.onnx` 不是软件源码，不能由根目录 MIT 自动重新授权。
 ## 标定说明
 
 - `main/fusion_config.h`：机械安装、激光发射器与三脚架旋转轴偏移；当前值为实测值。
