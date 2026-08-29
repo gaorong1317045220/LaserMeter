@@ -51,7 +51,7 @@ PC 工作台（pc_app/） <───┘
 | `assets/`、`tools/` | UI 源素材、生成器、标定、构建、烧录与打包工具 | 从源码完整复现时保留 |
 | `requirements-pc.lock.txt` | 已验证的 PC 运行依赖版本 | Python 方式运行必需 |
 
-本包不包含 ESP-IDF 安装环境、Python 安装环境、训练数据和 AI 训练流水线。ESP-IDF 与 Python 依赖由使用者按下文安装；这符合常规开源源码仓库的发布方式。
+本包不包含 ESP-IDF 安装环境、Python 安装环境、训练数据和 AI 训练流水线。ESP-IDF 与 Python 依赖由使用者按自行安装。
 
 ## ESP32-S3 构建与烧录
 
