@@ -12,7 +12,8 @@ sdkconfig
 # Local editor and Python cache
 .vscode/
 **/__pycache__/
-*.py[cod]
+*.pyc
+*.pyo
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
