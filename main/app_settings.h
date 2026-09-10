@@ -7,6 +7,7 @@
 enum class DistanceUnit : uint8_t {
     MILLIMETRES = 0,
     METRES = 1,
+    CENTIMETRES = 2,
 };
 
 struct AppSettings {

@@ -635,7 +635,7 @@ static void load_app_settings()
     }
     // Single-distance results are always reviewed before a manual save.
     // Migrate older NVS values that could skip the frozen-result screen.
-    // NOTE: distance_unit is a user setting (mm/m) and must NOT be reset here;
+    // NOTE: distance_unit is a user setting (mm/cm/m) and must NOT be reset here;
     // only the removed auto-save/photo flags are migrated to their fixed values.
     const bool migrated = loaded.auto_save_single || !loaded.photo_on_measure;
     loaded.auto_save_single = false;
@@ -6151,20 +6151,30 @@ static bool device_ui_delete_measurement_record(uint32_t id)
 
 static void device_ui_cycle_setting(uint8_t category)
 {
-    // 距离单位(mm/m)循环;自动保存/测量时拍照已从设置页移除。
+    // 距离单位(mm/cm/m)循环;自动保存/测量时拍照已从设置页移除。
     // NVS 写入交给 nvs_flush 任务异步执行(LVGL 任务内同步擦写会阻塞/崩溃)。
     if (category == 2) {
         dashboard_lock();
         AppSettings settings = s_app_settings;
-        settings.distance_unit = settings.distance_unit == DistanceUnit::MILLIMETRES
-                                     ? DistanceUnit::METRES
-                                     : DistanceUnit::MILLIMETRES;
+        switch (settings.distance_unit) {
+        case DistanceUnit::MILLIMETRES:
+            settings.distance_unit = DistanceUnit::CENTIMETRES;
+            break;
+        case DistanceUnit::CENTIMETRES:
+            settings.distance_unit = DistanceUnit::METRES;
+            break;
+        case DistanceUnit::METRES:
+        default:
+            settings.distance_unit = DistanceUnit::MILLIMETRES;
+            break;
+        }
         s_app_settings = settings;
         dashboard_unlock();
         s_settings_save_pending.store(true, std::memory_order_release);
         publish_app_settings(settings);
-        dashboard_log_event("setting", settings.distance_unit == DistanceUnit::METRES
-                                           ? "distance unit: m" : "distance unit: mm");
+        const char *unit_name = settings.distance_unit == DistanceUnit::METRES ? "m" :
+                                settings.distance_unit == DistanceUnit::CENTIMETRES ? "cm" : "mm";
+        dashboard_log_event("setting", std::string("distance unit: ") + unit_name);
     }
 }
 

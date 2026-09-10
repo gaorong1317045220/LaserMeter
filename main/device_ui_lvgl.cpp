@@ -418,6 +418,29 @@ lv_obj_t *button(lv_obj_t *parent, const char *caption, int x, int y, int w, int
     return obj;
 }
 
+void format_distance_mm(char *buffer, size_t buffer_size, float distance_mm,
+                        uint8_t unit, bool spaced = false, bool show_sign = false)
+{
+    const char *separator = spaced ? " " : "";
+    if (unit == static_cast<uint8_t>(DistanceUnit::METRES)) {
+        std::snprintf(buffer, buffer_size, show_sign ? "%+.3f%sm" : "%.3f%sm",
+                      distance_mm / 1000.0f, separator);
+    } else if (unit == static_cast<uint8_t>(DistanceUnit::CENTIMETRES)) {
+        std::snprintf(buffer, buffer_size, show_sign ? "%+.1f%scm" : "%.1f%scm",
+                      distance_mm / 10.0f, separator);
+    } else {
+        std::snprintf(buffer, buffer_size, show_sign ? "%+.0f%smm" : "%.0f%smm",
+                      distance_mm, separator);
+    }
+}
+
+const char *distance_unit_setting_name(uint8_t unit)
+{
+    if (unit == static_cast<uint8_t>(DistanceUnit::METRES)) return "米(m)";
+    if (unit == static_cast<uint8_t>(DistanceUnit::CENTIMETRES)) return "厘米(cm)";
+    return "毫米(mm)";
+}
+
 void go(Page page)
 {
     if (page != s_page) {
@@ -560,6 +583,7 @@ void event_single(lv_event_t *event)
             };
             lv_img_set_src(s_zoom_image, zoom_assets[s_zoom]);
         }
+        if (s_zoom_text) lv_label_set_text(s_zoom_text, s_zoom ? "2X" : "1X");
         break;
     case 4:
         if (s_ui_state && s_ui_state->single_state == SingleDistanceState::AIMING) {
@@ -833,12 +857,9 @@ void bind_history_slot(uint8_t slot, uint8_t record_index, uint8_t first)
     if (record.type == DeviceUiMeasurementRecord::Type::FLOORPLAN)
         std::snprintf(value, sizeof(value), "编号 %lu",
                       static_cast<unsigned long>(record.floorplan_number));
-    else if (s_ui_state->setting_distance_unit == static_cast<uint8_t>(DistanceUnit::METRES))
-        std::snprintf(value, sizeof(value), "%.3f m",
-                      record.distance_mm / 1000.0f);
     else
-        std::snprintf(value, sizeof(value), "%ld mm",
-                      static_cast<long>(record.distance_mm));
+        format_distance_mm(value, sizeof(value), static_cast<float>(record.distance_mm),
+                           s_ui_state->setting_distance_unit, true);
     lv_label_set_text(s_history_value[slot], value);
 
     char date[24], time[16];
@@ -1053,10 +1074,8 @@ void build_record_detail(const DeviceUiState &state)
     style_screen(panel, 0x000000); lv_obj_set_style_radius(panel, 5, 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_80, 0);
     char distance[28];
-    if (state.setting_distance_unit == static_cast<uint8_t>(DistanceUnit::METRES))
-        std::snprintf(distance, sizeof(distance), "%.3f m", record.distance_mm / 1000.0f);
-    else
-        std::snprintf(distance, sizeof(distance), "%ldmm", static_cast<long>(record.distance_mm));
+    format_distance_mm(distance, sizeof(distance), static_cast<float>(record.distance_mm),
+                       state.setting_distance_unit);
     lv_obj_t *value = text(panel, distance, 0, 0); lv_obj_center(value);
     lv_obj_t *bottom = overlay_bar(s_root, 239, 45);
     image_asset(bottom, &ui_single_bottom_delete, 88, 10);
@@ -1105,7 +1124,7 @@ void build_settings(const DeviceUiState &state)
     // 5 行设置卡片(设计稿资产复用,选中项高亮)
     // 无线网络状态:连接成功优先显示"已连接",否则按 WiFi 开启状态显示
     const char *values[] = {
-        state.setting_distance_unit == static_cast<uint8_t>(DistanceUnit::METRES) ? "米(m)" : "毫米(mm)",
+        distance_unit_setting_name(state.setting_distance_unit),
         state.pc_link_connected ? "已连接" : (state.wifi_ready ? "未连接" : "未开启"),
         "", "实时", ""};
     const char *names[] = {"距离单位", "无线网络", "设备标定", "设备状态", "解除绑定"};
@@ -1255,10 +1274,16 @@ void build_measure(const DeviceUiState &state)
     if (complete) {
         lv_obj_t *result = overlay_bar(s_root, 48, 137);
         text(result, "A <-> B", 91, 5, kWhite);
-        std::snprintf(line, sizeof(line), "%.3f m", state.p2p_space_distance_m);
+        format_distance_mm(line, sizeof(line), state.p2p_space_distance_m * 1000.0f,
+                           state.setting_distance_unit, true);
         lv_obj_t *space = text(result, line, 0, 28, kGreen); lv_obj_align(space, LV_ALIGN_TOP_MID, 0, 28);
-        std::snprintf(line, sizeof(line), "水平：%.3f m", state.p2p_horizontal_distance_m); text(result, line, 47, 64);
-        std::snprintf(line, sizeof(line), "高差：%+.3f m", state.p2p_height_diff_m); text(result, line, 47, 88);
+        char distance[32];
+        format_distance_mm(distance, sizeof(distance), state.p2p_horizontal_distance_m * 1000.0f,
+                           state.setting_distance_unit, true);
+        std::snprintf(line, sizeof(line), "水平：%s", distance); text(result, line, 47, 64);
+        format_distance_mm(distance, sizeof(distance), state.p2p_height_diff_m * 1000.0f,
+                           state.setting_distance_unit, true, true);
+        std::snprintf(line, sizeof(line), "高差：%s", distance); text(result, line, 47, 88);
         const char *quality = state.p2p_motion_risk == 0 ? "稳定" :
                               state.p2p_motion_risk == 1 ? "一般" : "平移风险";
         std::snprintf(line, sizeof(line), "%s  %.1fdeg  %ums", quality,
@@ -1397,7 +1422,9 @@ void build_camera(const DeviceUiState &state)
         lv_label_set_text(s_camera_capture_status, "SD卡不可用");
         lv_obj_set_style_text_color(s_camera_capture_status, lv_color_hex(kRed), 0);
     }
-    button(s_root, s_zoom ? "2x" : "1x", 184, 166, 50, 50, event_single, 3);
+    lv_obj_t *zoom_button = button(s_root, s_zoom ? "2X" : "1X", 184, 166, 50, 50,
+                                   event_single, 3);
+    s_zoom_text = lv_obj_get_child(zoom_button, 0);
 }
 
 void rebuild_page(const DeviceUiState &state)
@@ -1525,12 +1552,9 @@ void update_single(const DeviceUiState &state)
     }
     char value[32];
     if (state.single_result_valid) {
-        if (state.setting_distance_unit == static_cast<uint8_t>(DistanceUnit::METRES))
-            std::snprintf(value, sizeof(value), "%.3fm",
-                          state.single_result.distance_mm / 1000.0f);
-        else
-            std::snprintf(value, sizeof(value), "%ldmm",
-                          static_cast<long>(state.single_result.distance_mm));
+        format_distance_mm(value, sizeof(value),
+                           static_cast<float>(state.single_result.distance_mm),
+                           state.setting_distance_unit);
     } else value[0] = '\0';
     lv_label_set_text(s_value, value);
     const char *message = "";
@@ -1599,12 +1623,12 @@ static void keys_camera(const KeyEvent &ev);
 static void keys_storage(const KeyEvent &ev, const DeviceUiState &state);
 static void keys_record_delete(const KeyEvent &ev, const DeviceUiState &state);
 static void keys_record_detail(const KeyEvent &ev, const DeviceUiState &state);
-static void keys_settings(const KeyEvent &ev);
+static void keys_settings(const KeyEvent &ev, DeviceUiState &state);
 static void keys_web(const KeyEvent &ev);
 static void keys_sensors(const KeyEvent &ev);
 static void keys_imu_cal(const KeyEvent &ev);
 
-void handle_keys(const DeviceUiState &state)
+void handle_keys(DeviceUiState &state)
 {
     const KeyEvent ev = read_key_events(state);
     // 确认框优先:任何页面有确认框时,测量=确认,Back=取消
@@ -1643,7 +1667,7 @@ void handle_keys(const DeviceUiState &state)
     case Page::STORAGE: keys_storage(ev, state); break;
     case Page::RECORD_DELETE: keys_record_delete(ev, state); break;
     case Page::RECORD_DETAIL: keys_record_detail(ev, state); break;
-    case Page::SETTINGS: keys_settings(ev); break;
+    case Page::SETTINGS: keys_settings(ev, state); break;
     case Page::WEB: keys_web(ev); break;
     case Page::SENSORS: keys_sensors(ev); break;
     case Page::IMU_CAL: keys_imu_cal(ev); break;
@@ -1819,14 +1843,19 @@ void keys_record_detail(const KeyEvent &ev, const DeviceUiState &state)
     }
 }
 
-void keys_settings(const KeyEvent &ev)
+void keys_settings(const KeyEvent &ev, DeviceUiState &state)
 {
     if (ev.ok) {
         s_settings_index = static_cast<uint8_t>((s_settings_index + 1) % 5);
         s_rebuild = true;
     } else if (ev.measure) {
         switch (s_settings_index) {
-        case 0: if (s_cb.cycle_setting) s_cb.cycle_setting(2); break;  // 距离单位
+        case 0:
+            if (s_cb.cycle_setting) s_cb.cycle_setting(2);
+            // The key event is handled after this loop's state snapshot was read.
+            // Refresh it now so the immediate rebuild cannot redraw the old unit.
+            if (s_cb.read_state) s_cb.read_state(&state);
+            break;  // 距离单位
         case 1: go(Page::WEB); break;                                   // 无线网络
         case 2: go(Page::IMU_CAL); break;                               // 设备标定
         case 3: go(Page::SENSORS); break;                               // 设备状态

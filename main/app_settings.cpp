@@ -39,7 +39,7 @@ esp_err_t app_settings_load(AppSettings *settings)
         settings->photo_on_measure = value != 0;
     }
     if (nvs_get_u8(handle, kUnitKey, &value) == ESP_OK &&
-        value <= static_cast<uint8_t>(DistanceUnit::METRES)) {
+        value <= static_cast<uint8_t>(DistanceUnit::CENTIMETRES)) {
         settings->distance_unit = static_cast<DistanceUnit>(value);
     }
     nvs_close(handle);
@@ -61,4 +61,3 @@ esp_err_t app_settings_save(const AppSettings &settings)
     nvs_close(handle);
     return err;
 }
-
