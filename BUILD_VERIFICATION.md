@@ -2,7 +2,7 @@
 
 验证日期：2026-09-11
 
-0.2.2 修复全量烧录、NVS 为空时，PSRAM 栈上的 `pc_link` 任务初始化 Wi-Fi 并写 NVS，触发 Flash Cache 安全断言后循环重启的问题。Wi-Fi 初始化、模式配置、启停和连接现统一由内部 RAM 栈上的 `wifi_ctrl` 任务执行；大型网络/JPEG/SD 处理仍保留在 PSRAM。0.2.1 的相机倍率同步、厘米单位和物理按键单位修复保持不变。
+0.2.2 修复全量烧录、NVS 为空时，PSRAM 栈上的 `pc_link` 任务初始化 Wi-Fi 并写 NVS，触发 Flash Cache 安全断言后循环重启的问题。Wi-Fi 初始化、模式配置、启停和连接现统一由内部 RAM 栈上的 `wifi_ctrl` 任务执行；大型网络/JPEG/SD 处理仍保留在 PSRAM。本次并发加固为控制请求增加完成编号、Wi-Fi 启动状态使用原子变量、STA/AP netif 创建和状态查询加锁，避免超时请求串线及 UI/PC-link/串口同时操作 Wi-Fi。0.2.1 的相机倍率同步、厘米单位和物理按键单位修复保持不变。
 
 ## 验证结果
 
@@ -11,6 +11,7 @@
 | UI 字体覆盖 | 通过 | `tools/check_ui_font_coverage.py`：178 个非 ASCII UI 字形全部存在，新增“厘”字可显示 |
 | ESP32-S3 固件构建 | 通过 | ESP-IDF 5.5.2、Python 3.12.10，`tools/build.ps1` 完成编译、链接和分区检查 |
 | Wi-Fi Flash 安全路径 | 通过 | `esp_wifi_init/set_config/start/stop/connect` 等控制调用仅位于内部栈 `wifi_ctrl` 分发函数；驱动配置使用 `WIFI_STORAGE_RAM` |
+| Wi-Fi 并发路径 | 通过 | 控制任务单实例启动、请求完成 ID 校验、Wi-Fi 状态原子读写、STA/AP netif 创建及扫描/状态查询互斥 |
 | 单位兼容性 | 通过 | 保留 NVS 值 `mm=0`、`m=1`，新增 `cm=2`；循环顺序为 `mm → cm → m → mm` |
 | 显示入口检查 | 通过 | 单点测距、P2P、历史列表、历史详情和设置页统一走单位格式化逻辑 |
 | Python 源码编译 | 通过 | `python -m compileall -q pc_app door_window_ai/src tools` |
@@ -26,8 +27,8 @@
 |---|---:|---|
 | `build/bootloader/bootloader.bin` | 20,992 | `DEFADCC948230277B63B26AA650D893ECF8984DF38E4ECD143B6F04915E29F75` |
 | `build/partition_table/partition-table.bin` | 3,072 | `5E71C3C890E04714DAA03B21A0D23953A2DADF9FDF15EEC02B886F7B6E9F8C81` |
-| `build/board_self_test.bin` | 2,019,280 | `D01E42312D5746B9223CC59CDBAF570A45DAD2D410B3BACE95D8705501F783F5` |
-| `Release/firmware/laser_meter_full.bin` | 2,084,816 | `BFC1832636EB694C722E4929D260FD500051A15DAD7A8B307E38A5230514F1EC` |
+| `build/board_self_test.bin` | 2,020,176 | `CF6DEA4609B0F662D0D1CBFF5B06BBA9D7A1E1621350F5DB5C5EB27B1B3C7868` |
+| `Release/firmware/laser_meter_full.bin` | 2,085,712 | `AB8EEA2EDEC9ADAE64BBF66588180B34179A8CA89B780E4A6C5415992692EAA3` |
 
 应用程序占 2 MiB factory 分区约 96%，剩余 `0x13030` 字节（约 4%）。构建成功，但继续增加字体、位图或功能时必须关注分区容量。
 

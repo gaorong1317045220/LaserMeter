@@ -143,7 +143,10 @@ static bool s_uart_laser_ready = false;
 static bool s_sd_mounted = false;
 static sdmmc_card_t *s_sd_card = nullptr;
 static bool s_wifi_ready = false;
-static bool s_wifi_started = false;
+// This flag is written by the internal Wi-Fi control task and read by the UI,
+// PC-link and console tasks.  Keep it atomic so a stop/start transition cannot
+// race with a status read.
+static std::atomic<bool> s_wifi_started{false};
 static esp_netif_t *s_wifi_sta_netif = nullptr;
 static esp_netif_t *s_wifi_ap_netif = nullptr;
 enum class WifiControlOperation : uint8_t {
@@ -168,8 +171,19 @@ struct WifiControlRequest {
 static TaskHandle_t s_wifi_control_task = nullptr;
 static SemaphoreHandle_t s_wifi_control_mutex = nullptr;
 static SemaphoreHandle_t s_wifi_control_done = nullptr;
+static SemaphoreHandle_t s_wifi_netif_mutex = nullptr;
+// 0 = not created, 1 = one caller is creating the task, 2 = ready.  This
+// closes the small startup window where the UI/action task and pc_link task
+// could both create a Wi-Fi control task.
+static std::atomic<uint8_t> s_wifi_control_start_state{0};
 static WifiControlRequest s_wifi_control_request;
 static esp_err_t s_wifi_control_result = ESP_FAIL;
+// A binary semaphore only tells a caller that *some* request completed.  The
+// ID lets a caller distinguish its own completion from a completion left by a
+// request that timed out while the control task was still busy.
+static std::atomic<uint32_t> s_wifi_control_next_id{0};
+static std::atomic<uint32_t> s_wifi_control_request_id{0};
+static std::atomic<uint32_t> s_wifi_control_completed_id{0};
 static httpd_handle_t s_camera_httpd = nullptr;
 static httpd_handle_t s_stream_httpd = nullptr;
 static httpd_handle_t s_file_httpd = nullptr;
@@ -5597,7 +5611,8 @@ static bool cmd_pc_status()
              binding.valid ? 1u : 0u,
              s_pc_pairing_active.load(std::memory_order_acquire) ? 1u : 0u,
              s_pc_link_connected.load(std::memory_order_acquire) ? 1u : 0u,
-             s_wifi_started ? 1u : 0u, binding.pc_name, binding.hotspot_ssid,
+             s_wifi_started.load(std::memory_order_acquire) ? 1u : 0u,
+             binding.pc_name, binding.hotspot_ssid,
              static_cast<unsigned>(binding.server_port),
              static_cast<unsigned>(s_pc_upload_count), static_cast<unsigned>(PC_UPLOAD_QUEUE_DEPTH),
              pending[0] ? pending : "-");
@@ -5661,7 +5676,7 @@ static void device_ui_read_state(DeviceUiState *out)
     out->camera_ready = s_camera_http_ready;
     // 设备状态页"激光器"显示硬件 UART 自检结果(而非是否正在测距)
     out->laser_ready = snap.check_laser_uart == DeviceCheckState::PASS;
-    out->wifi_ready = s_wifi_started;
+    out->wifi_ready = s_wifi_started.load(std::memory_order_acquire);
     out->web_busy = s_web_busy;
     out->pc_pairing_active = s_pc_pairing_active.load(std::memory_order_acquire);
     out->pc_binding_valid = s_pc_binding_loaded.load(std::memory_order_acquire) && binding.valid;
@@ -6618,14 +6633,14 @@ static esp_err_t wifi_base_init_once_internal()
 
 static esp_err_t wifi_stop_if_started_internal()
 {
-    if (!s_wifi_started) {
+    if (!s_wifi_started.load(std::memory_order_acquire)) {
         return ESP_OK;
     }
     esp_err_t err = esp_wifi_stop();
     if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
         return err;
     }
-    s_wifi_started = false;
+    s_wifi_started.store(false, std::memory_order_release);
     return ESP_OK;
 }
 
@@ -6646,7 +6661,7 @@ static esp_err_t wifi_control_dispatch(const WifiControlRequest &request)
                                 "wifi_ctrl", "set config");
         }
         const esp_err_t err = esp_wifi_start();
-        if (err == ESP_OK) s_wifi_started = true;
+        if (err == ESP_OK) s_wifi_started.store(true, std::memory_order_release);
         return err;
     }
     case WifiControlOperation::CONNECT:
@@ -6667,27 +6682,61 @@ static void wifi_control_task(void *)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         // Copy before dispatch so a timed-out caller cannot overwrite the
         // request while this internal-stack task is still handling it.
+        const uint32_t request_id = s_wifi_control_request_id.load(std::memory_order_acquire);
         const WifiControlRequest request = s_wifi_control_request;
         s_wifi_control_result = wifi_control_dispatch(request);
+        s_wifi_control_completed_id.store(request_id, std::memory_order_release);
         xSemaphoreGive(s_wifi_control_done);
     }
 }
 
 static esp_err_t wifi_control_start_once()
 {
-    if (s_wifi_control_task) return ESP_OK;
-    if (!s_wifi_control_mutex) s_wifi_control_mutex = xSemaphoreCreateMutex();
-    if (!s_wifi_control_done) s_wifi_control_done = xSemaphoreCreateBinary();
-    if (!s_wifi_control_mutex || !s_wifi_control_done) return ESP_ERR_NO_MEM;
-    // Pin the stack capability explicitly: this task is the only place where
-    // Wi-Fi APIs that may access NVS/flash are executed.
-    if (xTaskCreateWithCaps(wifi_control_task, "wifi_ctrl", 8192, nullptr, 6,
-                            &s_wifi_control_task,
-                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
-        s_wifi_control_task = nullptr;
-        return ESP_ERR_NO_MEM;
+    while (true) {
+        const uint8_t state = s_wifi_control_start_state.load(std::memory_order_acquire);
+        if (state == 2) return ESP_OK;
+        if (state == 1) {
+            vTaskDelay(1);
+            continue;
+        }
+        uint8_t expected = 0;
+        if (!s_wifi_control_start_state.compare_exchange_weak(
+                expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            continue;
+        }
+        if (!s_wifi_control_mutex) s_wifi_control_mutex = xSemaphoreCreateMutex();
+        if (!s_wifi_control_done) s_wifi_control_done = xSemaphoreCreateBinary();
+        if (!s_wifi_netif_mutex) s_wifi_netif_mutex = xSemaphoreCreateMutex();
+        if (!s_wifi_control_mutex || !s_wifi_control_done || !s_wifi_netif_mutex) {
+            s_wifi_control_start_state.store(0, std::memory_order_release);
+            return ESP_ERR_NO_MEM;
+        }
+        // Pin the stack capability explicitly: this task is the only place where
+        // Wi-Fi APIs that may access NVS/flash are executed.
+        if (xTaskCreateWithCaps(wifi_control_task, "wifi_ctrl", 8192, nullptr, 6,
+                                &s_wifi_control_task,
+                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+            s_wifi_control_task = nullptr;
+            s_wifi_control_start_state.store(0, std::memory_order_release);
+            return ESP_ERR_NO_MEM;
+        }
+        s_wifi_control_start_state.store(2, std::memory_order_release);
+        return ESP_OK;
     }
-    return ESP_OK;
+}
+
+static esp_netif_t *wifi_get_or_create_netif(bool station)
+{
+    if (wifi_control_start_once() != ESP_OK || !s_wifi_netif_mutex) return nullptr;
+    if (xSemaphoreTake(s_wifi_netif_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return nullptr;
+    esp_netif_t **slot = station ? &s_wifi_sta_netif : &s_wifi_ap_netif;
+    if (!*slot) {
+        *slot = station ? esp_netif_create_default_wifi_sta()
+                        : esp_netif_create_default_wifi_ap();
+    }
+    esp_netif_t *result = *slot;
+    xSemaphoreGive(s_wifi_netif_mutex);
+    return result;
 }
 
 static esp_err_t wifi_control_call(const WifiControlRequest &request)
@@ -6699,11 +6748,26 @@ static esp_err_t wifi_control_call(const WifiControlRequest &request)
     if (xSemaphoreTake(s_wifi_control_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    // Discard a stale completion token after an earlier timed-out caller.
+    // Discard a stale completion token after an earlier timed-out caller.  The
+    // request ID check below also covers the case where that completion races
+    // with submission of this request.
     xSemaphoreTake(s_wifi_control_done, 0);
+    const uint32_t request_id = s_wifi_control_next_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    s_wifi_control_request_id.store(request_id, std::memory_order_release);
     s_wifi_control_request = request;
     xTaskNotifyGive(s_wifi_control_task);
-    const bool completed = xSemaphoreTake(s_wifi_control_done, pdMS_TO_TICKS(30000)) == pdTRUE;
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
+    bool completed = false;
+    while (xTaskGetTickCount() < deadline) {
+        const TickType_t remaining = deadline - xTaskGetTickCount();
+        if (xSemaphoreTake(s_wifi_control_done, remaining) != pdTRUE) break;
+        if (s_wifi_control_completed_id.load(std::memory_order_acquire) == request_id) {
+            completed = true;
+            break;
+        }
+        // A previous caller timed out.  Ignore its completion and continue
+        // waiting for this request's completion ID.
+    }
     const esp_err_t result = completed ? s_wifi_control_result : ESP_ERR_TIMEOUT;
     xSemaphoreGive(s_wifi_control_mutex);
     return result;
@@ -6766,6 +6830,31 @@ static esp_err_t wifi_set_bandwidth_controlled(wifi_interface_t interface,
     request.interface = interface;
     request.bandwidth = bandwidth;
     return wifi_control_call(request);
+}
+
+// Status/scan queries are also serialized with start/stop/configure calls.
+// The ESP-IDF driver has its own locks, but keeping every Wi-Fi entry point in
+// one critical section prevents a UI stop or mode switch from racing a query.
+static esp_err_t wifi_sta_get_ap_info_controlled(wifi_ap_record_t *record)
+{
+    if (!record || wifi_control_start_once() != ESP_OK) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_wifi_control_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const esp_err_t err = esp_wifi_sta_get_ap_info(record);
+    xSemaphoreGive(s_wifi_control_mutex);
+    return err;
+}
+
+static esp_err_t wifi_ap_get_sta_list_controlled(wifi_sta_list_t *stations)
+{
+    if (!stations || wifi_control_start_once() != ESP_OK) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_wifi_control_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const esp_err_t err = esp_wifi_ap_get_sta_list(stations);
+    xSemaphoreGive(s_wifi_control_mutex);
+    return err;
 }
 
 static bool pc_binding_load(PcBinding *binding)
@@ -7021,7 +7110,7 @@ static void pc_time_sync_apply(int64_t utc_ms, int16_t tz_min)
 static esp_err_t pc_start_pairing_ap()
 {
     ESP_RETURN_ON_ERROR(wifi_base_init_once(), "pc_pair", "wifi init");
-    if (!s_wifi_ap_netif) s_wifi_ap_netif = esp_netif_create_default_wifi_ap();
+    if (!wifi_get_or_create_netif(false)) return ESP_ERR_NO_MEM;
     wifi_config_t config = {};
     snprintf(reinterpret_cast<char *>(config.ap.ssid), sizeof(config.ap.ssid), "%s", PC_PAIRING_SSID);
     snprintf(reinterpret_cast<char *>(config.ap.password), sizeof(config.ap.password), "%s",
@@ -7042,7 +7131,7 @@ static esp_err_t pc_start_pairing_ap()
 static bool pc_accept_binding(int server_socket, int64_t *station_since_us, uint8_t station_mac[6])
 {
     wifi_sta_list_t stations = {};
-    if (esp_wifi_ap_get_sta_list(&stations) == ESP_OK && stations.num > 0) {
+    if (wifi_ap_get_sta_list_controlled(&stations) == ESP_OK && stations.num > 0) {
         if (memcmp(station_mac, stations.sta[0].mac, 6) != 0) {
             memcpy(station_mac, stations.sta[0].mac, 6);
             *station_since_us = esp_timer_get_time();
@@ -7131,7 +7220,8 @@ static bool pc_connect_station(esp_ip4_addr_t *gateway)
 {
     if (!gateway) return false;
     ESP_RETURN_ON_FALSE(wifi_base_init_once() == ESP_OK, false, "pc_link", "wifi init failed");
-    if (!s_wifi_sta_netif) s_wifi_sta_netif = esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = wifi_get_or_create_netif(true);
+    if (!sta_netif) return false;
     const PcBinding binding = pc_binding_snapshot();
     if (!binding.valid) return false;
     wifi_config_t config = {};
@@ -7149,8 +7239,8 @@ static bool pc_connect_station(esp_ip4_addr_t *gateway)
     for (int attempt = 0; attempt < 150 && s_pc_link_enabled.load(std::memory_order_acquire); ++attempt) {
         wifi_ap_record_t ap = {};
         esp_netif_ip_info_t ip = {};
-        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK &&
-            esp_netif_get_ip_info(s_wifi_sta_netif, &ip) == ESP_OK && ip.ip.addr && ip.gw.addr) {
+        if (wifi_sta_get_ap_info_controlled(&ap) == ESP_OK &&
+            esp_netif_get_ip_info(sta_netif, &ip) == ESP_OK && ip.ip.addr && ip.gw.addr) {
             *gateway = ip.gw;
             ESP_LOGI("pc_link", "PC hotspot connected ssid=%s ip=" IPSTR " gateway=" IPSTR,
                      binding.hotspot_ssid, IP2STR(&ip.ip), IP2STR(&ip.gw));
@@ -7682,9 +7772,7 @@ static void pc_link_start_once()
 static esp_err_t wifi_init_once()
 {
     ESP_RETURN_ON_ERROR(wifi_base_init_once(), "wifi", "base init");
-    if (!s_wifi_sta_netif) {
-        s_wifi_sta_netif = esp_netif_create_default_wifi_sta();
-    }
+    if (!wifi_get_or_create_netif(true)) return ESP_ERR_NO_MEM;
     return wifi_configure_and_start(WIFI_MODE_STA, WIFI_IF_STA, nullptr);
 }
 
@@ -8766,9 +8854,7 @@ static esp_err_t device_file_server_start()
 static esp_err_t wifi_start_camera_ap()
 {
     ESP_RETURN_ON_ERROR(wifi_base_init_once(), "cam_ap", "wifi base");
-    if (!s_wifi_ap_netif) {
-        s_wifi_ap_netif = esp_netif_create_default_wifi_ap();
-    }
+    if (!wifi_get_or_create_netif(false)) return ESP_ERR_NO_MEM;
 
     wifi_config_t ap_config = {};
     const char *ssid = "ESP32-CAM-TEST";
@@ -8833,7 +8919,7 @@ static bool camera_init_for_device()
 
 static bool cmd_start_camera_ap()
 {
-    if (s_wifi_started && s_camera_httpd && s_stream_httpd) {
+    if (s_wifi_started.load(std::memory_order_acquire) && s_camera_httpd && s_stream_httpd) {
         pass("start_camera_ap", "web already online at http://192.168.4.1/");
         return true;
     }
@@ -8876,7 +8962,8 @@ static bool cmd_stop_camera_ap()
 static bool dashboard_toggle_web()
 {
     if (s_web_busy) return false;
-    const bool enable = !s_wifi_started || !s_pc_link_enabled.load(std::memory_order_acquire);
+    const bool enable = !s_wifi_started.load(std::memory_order_acquire) ||
+                        !s_pc_link_enabled.load(std::memory_order_acquire);
     s_web_busy = true;
     s_pc_link_enabled.store(enable, std::memory_order_release);
     if (!enable) s_pc_link_connected.store(false, std::memory_order_release);
@@ -8904,9 +8991,15 @@ static bool cmd_test_wifi()
         fail("test_wifi", "wifi init failed: " + esp_err_str(err));
         return false;
     }
+    if (!s_wifi_control_mutex ||
+        xSemaphoreTake(s_wifi_control_mutex, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        fail("test_wifi", "Wi-Fi control path is busy");
+        return false;
+    }
     wifi_scan_config_t scan = {};
     err = esp_wifi_scan_start(&scan, true);
     if (err != ESP_OK) {
+        xSemaphoreGive(s_wifi_control_mutex);
         fail("test_wifi", "scan failed: " + esp_err_str(err));
         return false;
     }
@@ -8917,6 +9010,7 @@ static bool cmd_test_wifi()
     if (getn) {
         esp_wifi_scan_get_ap_records(&getn, aps.data());
     }
+    xSemaphoreGive(s_wifi_control_mutex);
     for (int i = 0; i < getn; ++i) {
         info("test_wifi", "ssid=" + std::string(reinterpret_cast<char *>(aps[i].ssid)) + " rssi=" + std::to_string(aps[i].rssi));
     }
