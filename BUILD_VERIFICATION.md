@@ -26,10 +26,10 @@
 |---|---:|---|
 | `build/bootloader/bootloader.bin` | 20,992 | `DEFADCC948230277B63B26AA650D893ECF8984DF38E4ECD143B6F04915E29F75` |
 | `build/partition_table/partition-table.bin` | 3,072 | `5E71C3C890E04714DAA03B21A0D23953A2DADF9FDF15EEC02B886F7B6E9F8C81` |
-| `build/board_self_test.bin` | 2,019,152 | `18455AEFEAA3B18F915173EDE007DF4CDC1BA2592A696B29AC5F9DF8007199E0` |
-| `Release/firmware/laser_meter_full.bin` | 2,084,688 | `113317B15BFDBE1849243FEA25FD51377DFA2BBB3D0C4C84AA87733C52269893` |
+| `build/board_self_test.bin` | 2,019,280 | `D01E42312D5746B9223CC59CDBAF570A45DAD2D410B3BACE95D8705501F783F5` |
+| `Release/firmware/laser_meter_full.bin` | 2,084,816 | `BFC1832636EB694C722E4929D260FD500051A15DAD7A8B307E38A5230514F1EC` |
 
-应用程序占 2 MiB factory 分区约 96%，剩余 `0x130b0` 字节（约 4%）。构建成功，但继续增加字体、位图或功能时必须关注分区容量。
+应用程序占 2 MiB factory 分区约 96%，剩余 `0x13030` 字节（约 4%）。构建成功，但继续增加字体、位图或功能时必须关注分区容量。
 
 ## 便捷发布包
 

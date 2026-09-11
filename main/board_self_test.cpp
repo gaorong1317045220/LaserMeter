@@ -6665,7 +6665,10 @@ static void wifi_control_task(void *)
 {
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        s_wifi_control_result = wifi_control_dispatch(s_wifi_control_request);
+        // Copy before dispatch so a timed-out caller cannot overwrite the
+        // request while this internal-stack task is still handling it.
+        const WifiControlRequest request = s_wifi_control_request;
+        s_wifi_control_result = wifi_control_dispatch(request);
         xSemaphoreGive(s_wifi_control_done);
     }
 }
