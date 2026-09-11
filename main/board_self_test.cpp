@@ -146,6 +146,30 @@ static bool s_wifi_ready = false;
 static bool s_wifi_started = false;
 static esp_netif_t *s_wifi_sta_netif = nullptr;
 static esp_netif_t *s_wifi_ap_netif = nullptr;
+enum class WifiControlOperation : uint8_t {
+    INIT,
+    STOP,
+    CONFIGURE_AND_START,
+    CONNECT,
+    SET_POWER_SAVE,
+    SET_MAX_TX_POWER,
+    SET_BANDWIDTH,
+};
+struct WifiControlRequest {
+    WifiControlOperation operation = WifiControlOperation::INIT;
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    wifi_interface_t interface = WIFI_IF_STA;
+    wifi_config_t config = {};
+    bool has_config = false;
+    wifi_ps_type_t power_save = WIFI_PS_NONE;
+    int8_t max_tx_power = 0;
+    wifi_bandwidth_t bandwidth = WIFI_BW_HT20;
+};
+static TaskHandle_t s_wifi_control_task = nullptr;
+static SemaphoreHandle_t s_wifi_control_mutex = nullptr;
+static SemaphoreHandle_t s_wifi_control_done = nullptr;
+static WifiControlRequest s_wifi_control_request;
+static esp_err_t s_wifi_control_result = ESP_FAIL;
 static httpd_handle_t s_camera_httpd = nullptr;
 static httpd_handle_t s_stream_httpd = nullptr;
 static httpd_handle_t s_file_httpd = nullptr;
@@ -189,6 +213,7 @@ static PcBinding pc_binding_snapshot();
 static void process_pending_pc_binding_save();
 static void process_pending_pc_unbind();
 static void process_pending_time_sync_save();
+static esp_err_t wifi_control_start_once();
 static camera_jpeg_decoder_t *s_preview_decoder = nullptr;
 static std::atomic<uint8_t> s_camera_zoom{0};
 static uint8_t s_decoder_zoom = 0;
@@ -6546,7 +6571,7 @@ static bool cmd_runtime_status()
     return ok;
 }
 
-static esp_err_t wifi_base_init_once()
+static esp_err_t wifi_base_init_once_internal()
 {
     if (s_wifi_ready) {
         return ESP_OK;
@@ -6571,6 +6596,14 @@ static esp_err_t wifi_base_init_once()
              cfg.static_rx_buf_num, cfg.dynamic_rx_buf_num, cfg.static_tx_buf_num,
              cfg.dynamic_tx_buf_num, cfg.rx_mgmt_buf_num);
     ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), "wifi", "wifi init");
+    // PC binding is persisted by the application. Keep the Wi-Fi driver's
+    // runtime configuration in RAM so later AP/STA changes never write flash
+    // from the large pc_link task, whose stack intentionally lives in PSRAM.
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) {
+        esp_wifi_deinit();
+        return err;
+    }
     log_memory("after wifi init");
     if (!wifi_memory_headroom_ok()) {
         ESP_LOGE("heap", "Wi-Fi refused: require internal_free >= %u and largest >= %u",
@@ -6583,7 +6616,7 @@ static esp_err_t wifi_base_init_once()
     return ESP_OK;
 }
 
-static esp_err_t wifi_stop_if_started()
+static esp_err_t wifi_stop_if_started_internal()
 {
     if (!s_wifi_started) {
         return ESP_OK;
@@ -6594,6 +6627,142 @@ static esp_err_t wifi_stop_if_started()
     }
     s_wifi_started = false;
     return ESP_OK;
+}
+
+static esp_err_t wifi_control_dispatch(const WifiControlRequest &request)
+{
+    switch (request.operation) {
+    case WifiControlOperation::INIT:
+        return wifi_base_init_once_internal();
+    case WifiControlOperation::STOP:
+        return wifi_stop_if_started_internal();
+    case WifiControlOperation::CONFIGURE_AND_START: {
+        ESP_RETURN_ON_ERROR(wifi_base_init_once_internal(), "wifi_ctrl", "base init");
+        ESP_RETURN_ON_ERROR(wifi_stop_if_started_internal(), "wifi_ctrl", "stop");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(request.mode), "wifi_ctrl", "set mode");
+        if (request.has_config) {
+            wifi_config_t config = request.config;
+            ESP_RETURN_ON_ERROR(esp_wifi_set_config(request.interface, &config),
+                                "wifi_ctrl", "set config");
+        }
+        const esp_err_t err = esp_wifi_start();
+        if (err == ESP_OK) s_wifi_started = true;
+        return err;
+    }
+    case WifiControlOperation::CONNECT:
+        return esp_wifi_connect();
+    case WifiControlOperation::SET_POWER_SAVE:
+        return esp_wifi_set_ps(request.power_save);
+    case WifiControlOperation::SET_MAX_TX_POWER:
+        return esp_wifi_set_max_tx_power(request.max_tx_power);
+    case WifiControlOperation::SET_BANDWIDTH:
+        return esp_wifi_set_bandwidth(request.interface, request.bandwidth);
+    }
+    return ESP_ERR_INVALID_ARG;
+}
+
+static void wifi_control_task(void *)
+{
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        s_wifi_control_result = wifi_control_dispatch(s_wifi_control_request);
+        xSemaphoreGive(s_wifi_control_done);
+    }
+}
+
+static esp_err_t wifi_control_start_once()
+{
+    if (s_wifi_control_task) return ESP_OK;
+    if (!s_wifi_control_mutex) s_wifi_control_mutex = xSemaphoreCreateMutex();
+    if (!s_wifi_control_done) s_wifi_control_done = xSemaphoreCreateBinary();
+    if (!s_wifi_control_mutex || !s_wifi_control_done) return ESP_ERR_NO_MEM;
+    // Pin the stack capability explicitly: this task is the only place where
+    // Wi-Fi APIs that may access NVS/flash are executed.
+    if (xTaskCreateWithCaps(wifi_control_task, "wifi_ctrl", 8192, nullptr, 6,
+                            &s_wifi_control_task,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+        s_wifi_control_task = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t wifi_control_call(const WifiControlRequest &request)
+{
+    ESP_RETURN_ON_ERROR(wifi_control_start_once(), "wifi_ctrl", "task start");
+    if (xTaskGetCurrentTaskHandle() == s_wifi_control_task) {
+        return wifi_control_dispatch(request);
+    }
+    if (xSemaphoreTake(s_wifi_control_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    // Discard a stale completion token after an earlier timed-out caller.
+    xSemaphoreTake(s_wifi_control_done, 0);
+    s_wifi_control_request = request;
+    xTaskNotifyGive(s_wifi_control_task);
+    const bool completed = xSemaphoreTake(s_wifi_control_done, pdMS_TO_TICKS(30000)) == pdTRUE;
+    const esp_err_t result = completed ? s_wifi_control_result : ESP_ERR_TIMEOUT;
+    xSemaphoreGive(s_wifi_control_mutex);
+    return result;
+}
+
+static esp_err_t wifi_base_init_once()
+{
+    WifiControlRequest request;
+    request.operation = WifiControlOperation::INIT;
+    return wifi_control_call(request);
+}
+
+static esp_err_t wifi_stop_if_started()
+{
+    WifiControlRequest request;
+    request.operation = WifiControlOperation::STOP;
+    return wifi_control_call(request);
+}
+
+static esp_err_t wifi_configure_and_start(wifi_mode_t mode, wifi_interface_t interface,
+                                          const wifi_config_t *config)
+{
+    WifiControlRequest request;
+    request.operation = WifiControlOperation::CONFIGURE_AND_START;
+    request.mode = mode;
+    request.interface = interface;
+    request.has_config = config != nullptr;
+    if (config) request.config = *config;
+    return wifi_control_call(request);
+}
+
+static esp_err_t wifi_connect_controlled()
+{
+    WifiControlRequest request;
+    request.operation = WifiControlOperation::CONNECT;
+    return wifi_control_call(request);
+}
+
+static esp_err_t wifi_set_power_save_controlled(wifi_ps_type_t power_save)
+{
+    WifiControlRequest request;
+    request.operation = WifiControlOperation::SET_POWER_SAVE;
+    request.power_save = power_save;
+    return wifi_control_call(request);
+}
+
+static esp_err_t wifi_set_max_tx_power_controlled(int8_t max_tx_power)
+{
+    WifiControlRequest request;
+    request.operation = WifiControlOperation::SET_MAX_TX_POWER;
+    request.max_tx_power = max_tx_power;
+    return wifi_control_call(request);
+}
+
+static esp_err_t wifi_set_bandwidth_controlled(wifi_interface_t interface,
+                                               wifi_bandwidth_t bandwidth)
+{
+    WifiControlRequest request;
+    request.operation = WifiControlOperation::SET_BANDWIDTH;
+    request.interface = interface;
+    request.bandwidth = bandwidth;
+    return wifi_control_call(request);
 }
 
 static bool pc_binding_load(PcBinding *binding)
@@ -6850,7 +7019,6 @@ static esp_err_t pc_start_pairing_ap()
 {
     ESP_RETURN_ON_ERROR(wifi_base_init_once(), "pc_pair", "wifi init");
     if (!s_wifi_ap_netif) s_wifi_ap_netif = esp_netif_create_default_wifi_ap();
-    ESP_RETURN_ON_ERROR(wifi_stop_if_started(), "pc_pair", "wifi stop");
     wifi_config_t config = {};
     snprintf(reinterpret_cast<char *>(config.ap.ssid), sizeof(config.ap.ssid), "%s", PC_PAIRING_SSID);
     snprintf(reinterpret_cast<char *>(config.ap.password), sizeof(config.ap.password), "%s",
@@ -6859,11 +7027,10 @@ static esp_err_t pc_start_pairing_ap()
     config.ap.channel = 6;
     config.ap.max_connection = 2;
     config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), "pc_pair", "AP mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &config), "pc_pair", "AP config");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), "pc_pair", "AP start");
-    esp_wifi_set_max_tx_power(WIFI_AP_MAX_TX_POWER_QDBM);
-    s_wifi_started = true;
+    ESP_RETURN_ON_ERROR(wifi_configure_and_start(WIFI_MODE_AP, WIFI_IF_AP, &config),
+                        "pc_pair", "AP start");
+    ESP_RETURN_ON_ERROR(wifi_set_max_tx_power_controlled(WIFI_AP_MAX_TX_POWER_QDBM),
+                        "pc_pair", "AP tx power");
     s_pc_pairing_active.store(true, std::memory_order_release);
     dashboard_log_event("pc_link", std::string("pairing AP started ssid=") + PC_PAIRING_SSID);
     return ESP_OK;
@@ -6962,7 +7129,6 @@ static bool pc_connect_station(esp_ip4_addr_t *gateway)
     if (!gateway) return false;
     ESP_RETURN_ON_FALSE(wifi_base_init_once() == ESP_OK, false, "pc_link", "wifi init failed");
     if (!s_wifi_sta_netif) s_wifi_sta_netif = esp_netif_create_default_wifi_sta();
-    ESP_RETURN_ON_FALSE(wifi_stop_if_started() == ESP_OK, false, "pc_link", "wifi stop failed");
     const PcBinding binding = pc_binding_snapshot();
     if (!binding.valid) return false;
     wifi_config_t config = {};
@@ -6974,12 +7140,9 @@ static bool pc_connect_station(esp_ip4_addr_t *gateway)
     config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK ||
-        esp_wifi_set_config(WIFI_IF_STA, &config) != ESP_OK ||
-        esp_wifi_start() != ESP_OK) return false;
-    s_wifi_started = true;
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_connect();
+    if (wifi_configure_and_start(WIFI_MODE_STA, WIFI_IF_STA, &config) != ESP_OK ||
+        wifi_set_power_save_controlled(WIFI_PS_NONE) != ESP_OK ||
+        wifi_connect_controlled() != ESP_OK) return false;
     for (int attempt = 0; attempt < 150 && s_pc_link_enabled.load(std::memory_order_acquire); ++attempt) {
         wifi_ap_record_t ap = {};
         esp_netif_ip_info_t ip = {};
@@ -7493,9 +7656,16 @@ static void pc_link_start_once()
         dashboard_unlock();
         s_pc_binding_loaded.store(true, std::memory_order_release);
     }
+    const esp_err_t wifi_control_err = wifi_control_start_once();
+    if (wifi_control_err != ESP_OK) {
+        dashboard_set_error("Wi-Fi control task allocation failed: " +
+                            std::string(esp_err_to_name(wifi_control_err)));
+        return;
+    }
     if (!s_pc_link_task) {
         // Networking, JPEG and SD paths need a large stack. NVS persistence is
-        // delegated to app_main, so this task can safely live in PSRAM.
+        // delegated to internal-stack workers. Wi-Fi driver control is routed
+        // through wifi_ctrl for the same flash-cache safety requirement.
         const BaseType_t created = xTaskCreateWithCaps(
             pc_link_task, "pc_link", 32768, nullptr, 5, &s_pc_link_task,
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -7512,11 +7682,7 @@ static esp_err_t wifi_init_once()
     if (!s_wifi_sta_netif) {
         s_wifi_sta_netif = esp_netif_create_default_wifi_sta();
     }
-    ESP_RETURN_ON_ERROR(wifi_stop_if_started(), "wifi", "stop before sta");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), "wifi", "sta mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), "wifi", "sta start");
-    s_wifi_started = true;
-    return ESP_OK;
+    return wifi_configure_and_start(WIFI_MODE_STA, WIFI_IF_STA, nullptr);
 }
 
 static esp_err_t camera_http_init(bool fast_restore)
@@ -8600,7 +8766,6 @@ static esp_err_t wifi_start_camera_ap()
     if (!s_wifi_ap_netif) {
         s_wifi_ap_netif = esp_netif_create_default_wifi_ap();
     }
-    ESP_RETURN_ON_ERROR(wifi_stop_if_started(), "cam_ap", "wifi stop");
 
     wifi_config_t ap_config = {};
     const char *ssid = "ESP32-CAM-TEST";
@@ -8613,19 +8778,19 @@ static esp_err_t wifi_start_camera_ap()
     ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ap_config.ap.pmf_cfg.required = false;
 
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), "cam_ap", "ap mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_config), "cam_ap", "ap config");
-    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
     log_memory("before Wi-Fi radio start");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), "cam_ap", "ap start");
+    ESP_RETURN_ON_ERROR(wifi_configure_and_start(WIFI_MODE_AP, WIFI_IF_AP, &ap_config),
+                        "cam_ap", "ap start");
+    ESP_RETURN_ON_ERROR(wifi_set_bandwidth_controlled(WIFI_IF_AP, WIFI_BW_HT20),
+                        "cam_ap", "set bandwidth");
     log_memory("after Wi-Fi radio start");
     if (!wifi_memory_headroom_ok()) {
-        esp_wifi_stop();
+        wifi_stop_if_started();
         ESP_LOGE("heap", "Wi-Fi stopped: insufficient internal-RAM headroom");
         return ESP_ERR_NO_MEM;
     }
-    ESP_RETURN_ON_ERROR(esp_wifi_set_max_tx_power(WIFI_AP_MAX_TX_POWER_QDBM), "cam_ap", "set 8 dBm tx power");
-    s_wifi_started = true;
+    ESP_RETURN_ON_ERROR(wifi_set_max_tx_power_controlled(WIFI_AP_MAX_TX_POWER_QDBM),
+                        "cam_ap", "set 8 dBm tx power");
     return ESP_OK;
 }
 
